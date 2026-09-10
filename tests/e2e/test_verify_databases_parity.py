@@ -228,10 +228,16 @@ async def _run_database_parity_e2e(temp_test_dir):
     project_path = Path("tests/fixtures/sample_projects").resolve()
     
     db_types_to_run = []
+    # 收集每个后端被跳过的原因。全部跳过后并入 test 级 skip 消息 ——
+    # 本文件在跳过的用例上不会把 print 输出到 CI 日志，只有把原因交给
+    # pytest.skip() 才能在 `pytest -rs` 下被审计到，避免"跳过理由不可信"。
+    skip_reasons = []
     pkg_map = {"kuzudb": "kuzu", "ladybugdb": "ladybug", "falkordb": "falkordb", "neo4j": "neo4j"}
     for db in ["kuzudb", "ladybugdb", "falkordb", "neo4j"]:
         if importlib.util.find_spec(pkg_map[db]) is None:
-            print(f"Skipping {db}: {pkg_map[db]} driver not installed.")
+            reason = f"{db}: {pkg_map[db]} driver not installed."
+            print(f"Skipping {reason}")
+            skip_reasons.append(reason)
             continue
         if db in ("kuzudb", "ladybugdb"):
             # find_spec() 只能证明包目录存在，证明不了底层原生库能加载，两者会脱钩。
@@ -243,11 +249,15 @@ async def _run_database_parity_e2e(temp_test_dir):
             # 而不是以失败告终 —— 否则环境/打包问题会被误报成代码缺陷。
             probe_err = _probe_embedded_backend(pkg_map[db])
             if probe_err is not None:
-                print(f"Skipping {db}: {pkg_map[db]} installed but native backend unusable -> {probe_err}")
+                reason = f"{db}: {pkg_map[db]} installed but native backend unusable -> {probe_err}"
+                print(f"Skipping {reason}")
+                skip_reasons.append(reason)
                 continue
         if db == "falkordb" and is_falkordb_usable is not None and not is_falkordb_usable():
-            print("Skipping falkordb: FalkorDB Lite is not supported/installed on this platform "
-                  "(requires Unix and Python >= 3.12).")
+            reason = ("falkordb: FalkorDB Lite is not supported/installed on this platform "
+                      "(requires Unix and Python >= 3.12).")
+            print(f"Skipping {reason}")
+            skip_reasons.append(reason)
             continue
         db_types_to_run.append(db)
         
@@ -264,7 +274,8 @@ async def _run_database_parity_e2e(temp_test_dir):
             }
         except Exception as e:
             if db_type == "neo4j" and "failed to connect" in str(e).lower():
-                pytest.skip("Neo4j server is not running/available.")
+                pytest.skip("Neo4j server is not running/available. "
+                            "Skipped backends -> " + ("; ".join(skip_reasons) if skip_reasons else "(none recorded)"))
             raise e
             
     # Compile comparison and assert parity
@@ -274,7 +285,8 @@ async def _run_database_parity_e2e(temp_test_dir):
     print("-" * (35 + 13 * len(db_types)))
     
     if not results:
-        pytest.skip("No database drivers are installed to run parity tests.")
+        pytest.skip("No database drivers are installed to run parity tests. "
+                    "Skipped backends -> " + ("; ".join(skip_reasons) if skip_reasons else "(none recorded)"))
     
     # We will use the keys from the first available database as reference
     ref_db = next(iter(results.values()))
