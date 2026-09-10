@@ -4,10 +4,47 @@ import time
 import json
 import shutil
 import asyncio
-import tempfile
 import pytest
 from pathlib import Path
 from typing import Tuple, Dict
+
+def _probe_embedded_backend(module_name: str):
+    """探测嵌入式后端（kuzu / ladybug）在本环境是否真的可用。
+
+    返回 None 表示可用；否则返回失败原因字符串。
+
+    ⚠️ **必须在子进程里做**：本文件的既有约定就是"索引跑在子进程里，以隔离
+    pybind11 命名空间与数据库环境"。在主进程里 import kuzu/ladybug 的原生模块
+    会与之冲突 —— 实测直接 SIGSEGV（exit code 139），把 ubuntu / macos /
+    windows 三个平台的 e2e 全部打挂。
+
+    之所以需要这个探测：find_spec() 只证明"包目录存在"，证明不了"原生库能加载"，
+    两者会脱钩。实测 ladybug 0.19.1 的 cp314-win_amd64 wheel 缺 lbug C API
+    共享库 —— 包确实装着，但 Database() 初始化抛 RuntimeError。
+    """
+    code = (
+        "import os, sys, tempfile, shutil\n"
+        "mod = __import__(sys.argv[1])\n"
+        "d = tempfile.mkdtemp(prefix='cgc_probe_')\n"
+        "try:\n"
+        "    db = mod.Database(os.path.join(d, 'probe.db'))\n"
+        "    c = getattr(db, 'close', None)\n"
+        "    if callable(c): c()\n"
+        "finally:\n"
+        "    shutil.rmtree(d, ignore_errors=True)\n"
+        "print('PROBE_OK')\n"
+    )
+    try:
+        r = subprocess.run([sys.executable, "-c", code, module_name],
+                           capture_output=True, text=True, timeout=180)
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    if r.returncode != 0 or "PROBE_OK" not in r.stdout:
+        tail = [ln for ln in (r.stderr or "").strip().splitlines() if ln.strip()]
+        detail = tail[-1][:200] if tail else f"exit code {r.returncode}"
+        return f"exit {r.returncode}: {detail}"
+    return None
+
 
 # We run indexing as a subprocess to keep PyBind11 namespace and database environments isolated
 async def run_indexing_in_process(db_type: str, project_path: Path, temp_test_dir: Path) -> Tuple[float, Dict[str, int], list]:
@@ -196,21 +233,8 @@ async def _run_database_parity_e2e(temp_test_dir):
             # "Could not find lbug C API shared library"，把整个 e2e 拖红。
             # 包"已安装"但后端不可用时，按本测试既有约定（缺驱动即 skip）应当跳过，
             # 而不是以失败告终 —— 否则环境/打包问题会被误报成代码缺陷。
-            probe_dir = None
-            probe_err = None
-            try:
-                mod = importlib.import_module(pkg_map[db])
-                probe_dir = tempfile.mkdtemp(prefix="cgc_probe_")
-                probe_db = mod.Database(os.path.join(probe_dir, "probe.db"))
-                _close = getattr(probe_db, "close", None)
-                if callable(_close):
-                    _close()
-            except Exception as e:  # 任何原生库加载/初始化失败都视为后端不可用
-                probe_err = f"{type(e).__name__}: {e}"
-            finally:
-                if probe_dir:
-                    shutil.rmtree(probe_dir, ignore_errors=True)
-            if probe_err:
+            probe_err = _probe_embedded_backend(pkg_map[db])
+            if probe_err is not None:
                 print(f"Skipping {db}: {pkg_map[db]} installed but native backend unusable -> {probe_err}")
                 continue
         db_types_to_run.append(db)
