@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 from ..utils.debug_log import debug_log
 from ..utils.path_sandbox import is_path_allowed
 from ..utils.cypher_readonly import is_read_only_cypher as _is_read_only_cypher, read_only_rejection_message
+from ..utils import graph_shapes
 
 app = FastAPI()
 
@@ -236,6 +237,15 @@ async def get_graph(repo_path: Optional[str] = None, cypher_query: Optional[str]
                                 # Extract name/label for frontend
                                 # Prefer 'name' property, fallback to 'label', then 'path' or 'Unknown'
                                 display_name = str(props.get('name', props.get('label', props.get('path', 'Unknown'))))
+                                if display_name == "<module>":
+                                    _fpath = str(props.get('path', props.get('file', '')))
+                                    if _fpath:
+                                        # Same plain-filename label as the payload builders in
+                                        # cli_helpers/visualize_graph, so one node cannot
+                                        # render two different names in different views.
+                                        display_name = os.path.basename(_fpath)
+                                        props['name'] = display_name
+                                        props['label'] = display_name
                                 
                                 nodes_dict[eid] = {
                                     "id": eid,
@@ -469,6 +479,12 @@ def parse_node(node, nodes_dict):
             except: pass
             
     display_name = str(props.get('name', props.get('label', props.get('path', 'Unknown'))))
+    if display_name == "<module>":
+        _fpath = str(props.get('path', props.get('file', '')))
+        if _fpath:
+            display_name = os.path.basename(_fpath)
+            props['name'] = display_name
+            props['label'] = display_name
     
     nodes_dict[eid] = {
         "id": eid,
@@ -533,18 +549,13 @@ def parse_element(val, nodes_dict, edges):
             parse_element(r, nodes_dict, edges)
         return
         
-    type_name = type(val).__name__
-    
-    is_dict_rel = isinstance(val, dict) and (
-        any(k in val for k in ('_src', '_dst', '_SRC', '_DST', 'src_node', 'dest_node'))
-    )
-    is_dict_node = isinstance(val, dict) and (
-        '_label' in val or '_LABEL' in val or 'labels' in val
-    ) and not is_dict_rel
-
-    if type_name in ('Node', 'KuzuNode') or is_dict_node:
+    # Classification is duck-typed and shared with the offline renderer (see
+    # utils/graph_shapes). Matching on class name used to miss FalkorDB's
+    # `Edge`, so every FalkorDB relationship was dropped here even though
+    # `parse_rel` below reads it correctly.
+    if graph_shapes.is_node(val):
         parse_node(val, nodes_dict)
-    elif type_name in ('Relationship', 'KuzuRelationship') or is_dict_rel:
+    elif graph_shapes.is_relationship(val):
         parse_rel(val, edges)
     elif isinstance(val, (list, tuple)):
         for item in val:

@@ -711,6 +711,7 @@ def bundle_export(
     no_stats: bool = typer.Option(False, "--no-stats", help="Skip statistics generation"),
     sign_key: Optional[str] = typer.Option(None, "--sign-key", envvar="CGC_BUNDLE_SIGN_KEY", help="HMAC signing key (or set CGC_BUNDLE_SIGN_KEY)"),
     encrypt_password: Optional[str] = typer.Option(None, "--encrypt-password", envvar="CGC_BUNDLE_PASSWORD", help="Encrypt bundle with this password (or set CGC_BUNDLE_PASSWORD)", hide_input=True),
+    exclude_labels: Optional[str] = typer.Option(None, "--exclude-labels", help="Comma-separated node labels to leave out of the bundle, with their edges (e.g. DbTable,ExternalClass) (#1323)"),
     context: Optional[str] = typer.Option(None, "--context", "-c", help="Specific context to use"),
 ):
     """
@@ -760,6 +761,14 @@ def bundle_export(
             include_stats=not no_stats,
             sign_key=sign_key,
             encrypt_password=encrypt_password,
+            # bundle_export is also called programmatically (the golden
+            # harness does), where unpassed Typer options arrive as OptionInfo
+            # objects rather than their defaults — same trap the CLI meta-test
+            # documents for other commands.
+            exclude_labels=[
+                l for l in (exclude_labels if isinstance(exclude_labels, str) else "").split(",")
+                if l.strip()
+            ],
         )
         
         if success:
@@ -1137,6 +1146,7 @@ def export_shortcut(
     no_stats: bool = typer.Option(False, "--no-stats", help="Skip generating statistics in the bundle"),
     sign_key: Optional[str] = typer.Option(None, "--sign-key", envvar="CGC_BUNDLE_SIGN_KEY", help="HMAC signing key (or set CGC_BUNDLE_SIGN_KEY)"),
     encrypt_password: Optional[str] = typer.Option(None, "--encrypt-password", envvar="CGC_BUNDLE_PASSWORD", help="Encrypt bundle with this password (or set CGC_BUNDLE_PASSWORD)", hide_input=True),
+    exclude_labels: Optional[str] = typer.Option(None, "--exclude-labels", help="Comma-separated node labels to leave out of the bundle, with their edges (e.g. DbTable,ExternalClass) (#1323)"),
     context: Optional[str] = typer.Option(None, "--context", "-c", help="Specific context to use"),
 ):
     """Shortcut for 'cgc bundle export'"""
@@ -1146,6 +1156,7 @@ def export_shortcut(
         no_stats=no_stats,
         sign_key=sign_key,
         encrypt_password=encrypt_password,
+        exclude_labels=exclude_labels,
         context=context,
     )
 
@@ -2546,16 +2557,17 @@ def find_by_decorator_search(
 
 @find_app.command("argument")
 def find_by_argument_search(
-    argument: str = typer.Argument(..., help="Argument/parameter name to search for"),
+    argument: str = typer.Argument(..., help="Argument/parameter name or type to search for"),
     file: Optional[str] = typer.Option(None, "--file", "-f", help="Specific file path"),
     context: Optional[str] = typer.Option(None, "--context", "-c", help="Specific context to use"),
 ):
     """
-    Find functions that take a specific argument/parameter.
+    Find functions that take a specific argument/parameter name or type.
     
     Examples:
         cgc find argument password
         cgc find argument user_id --file src/auth.py
+        cgc find argument OrderFilter
     """
     _load_credentials()
     services = _initialize_services(context)
@@ -2571,7 +2583,7 @@ def find_by_argument_search(
             results = results[:req_limit]
         
         if not results:
-            console.print(f"[yellow]No functions found with argument '{argument}'[/yellow]")
+            console.print(f"[yellow]No functions found with argument name or type '{argument}'[/yellow]")
             return
             
         table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
@@ -3635,6 +3647,8 @@ def datasource_mysql(
     database: str = typer.Option(..., "--database", "-d", help="Database / schema name"),
     name: Optional[str] = typer.Option(None, "--name", "-n", help="Logical datasource name (default: mysql-<database>)"),
     env: str = typer.Option("production", "--env", "-e", help="Deployment environment label"),
+    ssl_verify: bool = typer.Option(False, "--ssl-verify", help="Connect over TLS and verify the server certificate (#1094)"),
+    ssl_ca_certs: Optional[str] = typer.Option(None, "--ssl-ca-certs", help="CA bundle path for --ssl-verify (default: system trust store)"),
     context: Optional[str] = typer.Option(None, "--context", "-c", help="CGC context to use"),
 ):
     """Ingest Aurora MySQL schema (tables + columns) and write to the code graph.
@@ -3650,7 +3664,8 @@ def datasource_mysql(
     console.print(f"[cyan]Connecting to Aurora MySQL at {host}:{port}/{database}...[/cyan]")
     try:
         result = mysql_ingest(host=host, port=port, user=user, password=password,
-                               database=database, name=name, env=env)
+                               database=database, name=name, env=env,
+                               ssl_verify=ssl_verify, ssl_ca_certs=ssl_ca_certs)
     except Exception as exc:
         console.print(f"[red]Failed to connect / ingest:[/red] {exc}")
         raise typer.Exit(1)
@@ -3672,6 +3687,8 @@ def datasource_cassandra(
     password: Optional[str] = typer.Option(None, "--password", "-P", help="Cassandra password", hide_input=True),
     name: Optional[str] = typer.Option(None, "--name", "-n", help="Logical datasource name (default: cassandra-<keyspace>)"),
     env: str = typer.Option("production", "--env", "-e", help="Deployment environment label"),
+    ssl_verify: bool = typer.Option(False, "--ssl-verify", help="Connect over TLS and verify the server certificate (#1094)"),
+    ssl_ca_certs: Optional[str] = typer.Option(None, "--ssl-ca-certs", help="CA bundle path for --ssl-verify (default: system trust store)"),
     context: Optional[str] = typer.Option(None, "--context", "-c", help="CGC context to use"),
 ):
     """Ingest Cassandra keyspace schema (tables + columns) and write to the code graph.
@@ -3688,7 +3705,8 @@ def datasource_cassandra(
     console.print(f"[cyan]Connecting to Cassandra at {hosts}/{keyspace}...[/cyan]")
     try:
         result = cassandra_ingest(hosts=hosts, port=port, keyspace=keyspace,
-                                   username=username, password=password, name=name, env=env)
+                                   username=username, password=password, name=name, env=env,
+                                   ssl_verify=ssl_verify, ssl_ca_certs=ssl_ca_certs)
     except Exception as exc:
         console.print(f"[red]Failed to connect / ingest:[/red] {exc}")
         raise typer.Exit(1)

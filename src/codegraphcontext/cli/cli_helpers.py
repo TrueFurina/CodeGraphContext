@@ -26,6 +26,7 @@ from ..core import get_database_manager
 from ..core.jobs import JobManager
 from ..tools.code_finder import CodeFinder
 from ..tools.graph_builder import GraphBuilder
+from ..utils import graph_shapes
 from ..tools.package_resolver import get_local_package_path
 from ..utils.debug_log import info_logger, warning_logger
 from ..core.database import Neo4jConnectionError
@@ -227,7 +228,14 @@ def _initialize_services(
                     _fail_services_init()
             else:
                 console.print(f"[bold red]Database Connection Error:[/bold red] {e}")
-                console.print("Please ensure your database is configured correctly or run 'cgc doctor'.")
+                if "Could not set lock on file" in str(e):
+                    console.print(
+                        "[yellow]Another CGC process already has this embedded database open. "
+                        "If a CGC Gateway or watcher is running, use its MCP/HTTP interface "
+                        "or stop it before running database-backed CLI commands.[/yellow]"
+                    )
+                else:
+                    console.print("Please ensure your database is configured correctly or run 'cgc doctor'.")
                 _fail_services_init()
     
     # The GraphBuilder requires an event loop, even for synchronous-style execution
@@ -334,6 +342,21 @@ def index_helper(path: str, context: Optional[str] = None, no_progress: bool = F
         db_manager.close_driver()
         raise typer.Exit(code=1)
 
+    # Register the repo in its named context BEFORE the already-indexed skip
+    # guard below: the early return used to sit above this call, so a graph
+    # populated by any path that skipped registration (MCP add_code_to_graph,
+    # an interrupted run) could never reconcile config.yaml through the normal
+    # command — 'cgc context list' showed "Repos Linked: 0" forever (#1317).
+    # Registration is idempotent, so running it on every invocation is safe.
+    # The resolved context name is used so a *default* named context registers
+    # too, not only an explicit --context flag.
+    if ctx.mode == "named":
+        register_context_name = context or getattr(ctx, "context_name", None)
+        if register_context_name:
+            if not register_repo_in_context(register_context_name, str(path_obj), auto_create=False):
+                db_manager.close_driver()
+                raise typer.Exit(code=1)
+
     indexed_repos = code_finder.list_indexed_repositories()
     repo_exists = any_repo_matches_path(indexed_repos, path_obj)
 
@@ -391,11 +414,6 @@ def index_helper(path: str, context: Optional[str] = None, no_progress: bool = F
                     console.print(f"[yellow]Repository '{path}' exists but has no files (likely interrupted). Re-indexing...[/yellow]")
         except Exception as e:
             console.print(f"[yellow]Warning: Could not check file count: {e}. Proceeding with indexing...[/yellow]")
-
-    if context and ctx.mode == "named":
-        if not register_repo_in_context(context, str(path_obj), auto_create=False):
-            db_manager.close_driver()
-            raise typer.Exit(code=1)
 
     console.print(f"Starting indexing for: {path_obj}")
 
@@ -657,44 +675,13 @@ def _render_offline_visualization(
     def _ident(value) -> Optional[str]:
         return None if value is None else str(value)
 
-    # Kùzu spells the internal record keys in lowercase (_label/_src/_dst/_id);
-    # Ladybug returns the same fields uppercased (_LABEL/_SRC/_DST/_ID). Look
-    # up both spellings so either backend reaches the offline renderer (#1458).
-    def _meta(d: dict, key: str, default=None):
-        if key in d:
-            return d[key]
-        return d.get(key.upper(), default)
-
-    def _has_meta(d: dict, key: str) -> bool:
-        return key in d or key.upper() in d
-
-    # Neo4j returns driver objects carrying .labels / .type that support
-    # dict()/Mapping access. FalkorDB's own driver objects also carry
-    # .labels on nodes, but are NOT dict-convertible — their properties live
-    # in a plain `.properties` dict, and its Edge exposes `.relation` /
-    # `.src_node` / `.dest_node` instead of `.type` / `.start_node` /
-    # `.end_node`. Kùzu and Ladybug return plain dicts carrying _label plus
-    # _src/_dst. Check the driver attributes first — a driver object may
-    # also be dict-like.
-    def _is_relationship(value) -> bool:
-        if hasattr(value, "labels"):
-            return False
-        if hasattr(value, "type"):
-            return True
-        if hasattr(value, "relation") and hasattr(value, "src_node"):
-            return True
-        return isinstance(value, dict) and _has_meta(value, "_src") and _has_meta(value, "_dst")
-
-    def _is_node(value) -> bool:
-        if hasattr(value, "labels"):
-            return True
-        if hasattr(value, "type"):
-            return False
-        if hasattr(value, "relation") and hasattr(value, "src_node"):
-            return False
-        # Kùzu relationships also carry _label, so _src/_dst is what
-        # distinguishes them from nodes.
-        return isinstance(value, dict) and _has_meta(value, "_label") and not _has_meta(value, "_src")
+    # Backend shape handling — which driver returns what, and why each spelling
+    # has to be accepted — lives in utils/graph_shapes, shared with the live
+    # web renderer in viz/server.py so the two cannot drift apart again.
+    _meta = graph_shapes.meta
+    _has_meta = graph_shapes.has_meta
+    _is_relationship = graph_shapes.is_relationship
+    _is_node = graph_shapes.is_node
 
     def _node_payload(value) -> Dict[str, Any]:
         if hasattr(value, "labels"):
@@ -709,10 +696,19 @@ def _render_offline_visualization(
             node_id = _meta(value, "_id")
         if node_id is None:
             node_id = props.get("path") or props.get("name")
+        
+        name = props.get("name") or props.get("path") or ""
+        if name == "<module>":
+            _fpath = props.get("path") or props.get("file_path") or ""
+            if _fpath:
+                name = Path(_fpath).name
+            else:
+                name = "<module>"
+
         return {
             "id": _ident(node_id),
             "label": label,
-            "name": props.get("name") or props.get("path") or "",
+            "name": name,
             "file_path": props.get("path", ""),
             "line_number": props.get("line_number"),
         }

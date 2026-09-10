@@ -23,6 +23,107 @@ from codegraphcontext.core.graph_query import GraphQueryInterface
 from ..utils.cypher_ddl import is_schema_ddl
 from codegraphcontext.utils.debug_log import debug_log, info_logger, error_logger, warning_logger
 
+# Default cap for ladybug/kuzu buffer pools (bytes). Both libraries otherwise
+# default to ~80% of system RAM, which lets long-running gateways grow huge.
+DEFAULT_EMBEDDED_BUFFER_POOL_BYTES = 4 * 1024**3
+
+# Floor for the availability-derived default, so a briefly-busy machine does
+# not shrink the pool into pathological territory.
+MIN_DEFAULT_BUFFER_POOL_BYTES = 256 * 1024**2
+
+
+def _cgroup_available_bytes():
+    """Memory headroom under the container's cgroup limit, or None when
+    unconfined. /proc/meminfo shows the HOST inside a container, so a pod
+    capped at 1 GiB on a 64 GiB host would otherwise size a 4 GiB pool and
+    be OOM-killed natively at first touch."""
+    # cgroup v2 (unified hierarchy)
+    try:
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw = f.read().strip()
+        if raw != "max":
+            limit = int(raw)
+            usage = 0
+            try:
+                with open("/sys/fs/cgroup/memory.current") as f:
+                    usage = int(f.read().strip())
+            except (OSError, ValueError):
+                pass
+            return max(limit - usage, 0)
+    except (OSError, ValueError):
+        pass
+    # cgroup v1
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
+            limit = int(f.read().strip())
+        if limit < 1 << 60:  # v1 reports ~8 EiB when unlimited
+            usage = 0
+            try:
+                with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
+                    usage = int(f.read().strip())
+            except (OSError, ValueError):
+                pass
+            return max(limit - usage, 0)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _available_memory_bytes():
+    """The tighter of host MemAvailable (/proc/meminfo) and the cgroup
+    memory headroom, or None where neither is readable (macOS…)."""
+    host = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    host = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        pass
+    cgroup = _cgroup_available_bytes()
+    if host is not None and cgroup is not None:
+        return min(host, cgroup)
+    return host if host is not None else cgroup
+
+
+def resolve_embedded_buffer_pool_size() -> int:
+    """
+    Resolve ``buffer_pool_size`` for embedded ``Database(...)`` constructors.
+
+    Reads ``CGC_EMBEDDED_BUFFER_POOL_MB`` (integer MiB). Unset uses an
+    adaptive default: 4 GiB, capped at half of currently-available memory
+    (floored at 256 MiB) — on a memory-constrained host (CI runners sharing
+    RAM with a Neo4j container, small VMs) a fixed 4 GiB pool made LadybugDB
+    fault natively (SIGSEGV, parity run exit -11) when the reservation could
+    not be backed. An explicit env value is always honored as-is; ``0`` opts
+    back into the library default (~80% of system memory).
+    """
+    raw = os.getenv("CGC_EMBEDDED_BUFFER_POOL_MB")
+    if raw is None or str(raw).strip() == "":
+        available = _available_memory_bytes()
+        if available is None:
+            return DEFAULT_EMBEDDED_BUFFER_POOL_BYTES
+        adaptive = max(MIN_DEFAULT_BUFFER_POOL_BYTES, available // 2)
+        return min(DEFAULT_EMBEDDED_BUFFER_POOL_BYTES, adaptive)
+    try:
+        mb = int(str(raw).strip())
+    except ValueError:
+        warning_logger(
+            f"Invalid CGC_EMBEDDED_BUFFER_POOL_MB={raw!r}; "
+            f"using default {DEFAULT_EMBEDDED_BUFFER_POOL_BYTES} bytes"
+        )
+        return DEFAULT_EMBEDDED_BUFFER_POOL_BYTES
+    if mb < 0:
+        warning_logger(
+            f"Invalid CGC_EMBEDDED_BUFFER_POOL_MB={raw!r}; "
+            f"using default {DEFAULT_EMBEDDED_BUFFER_POOL_BYTES} bytes"
+        )
+        return DEFAULT_EMBEDDED_BUFFER_POOL_BYTES
+    if mb == 0:
+        return 0
+    return mb * 1024**2
+
 
 @dataclass(frozen=True)
 class EmbeddedBackendSpec:
@@ -117,8 +218,24 @@ class EmbeddedGraphManager(GraphQueryInterface):
                     max_retries = 5
                     for attempt in range(max_retries):
                         try:
-                            info_logger(f"Initializing {spec.display_name} at {self.db_path}")
-                            self._db = backend.Database(self.db_path)
+                            buffer_pool_size = resolve_embedded_buffer_pool_size()
+                            if buffer_pool_size == 0:
+                                pool_msg = "library default (~80% of system memory)"
+                            else:
+                                pool_msg = f"{buffer_pool_size} bytes"
+                            info_logger(
+                                f"Initializing {spec.display_name} at {self.db_path} "
+                                f"(buffer_pool_size={pool_msg})"
+                            )
+                            if buffer_pool_size == 0:
+                                # 0 means "library default": omit the kwarg
+                                # rather than trusting every backend to treat
+                                # a literal 0 that way.
+                                self._db = backend.Database(self.db_path)
+                            else:
+                                self._db = backend.Database(
+                                    self.db_path, buffer_pool_size=buffer_pool_size
+                                )
 
                             # Initialise connection pool
                             self._pool = queue.Queue()
@@ -174,7 +291,7 @@ class EmbeddedGraphManager(GraphQueryInterface):
             ("Directory", "path STRING, name STRING, PRIMARY KEY (path)"),
             ("Module", "name STRING, lang STRING, full_import_name STRING, path STRING, line_number INT64, PRIMARY KEY (name)"),
             # For types with composite keys (name, path, line_number), we use a 'uid'
-            ("Function", "uid STRING, name STRING, path STRING, line_number INT64, occurrence_index INT64, end_line INT64, source STRING, docstring STRING, lang STRING, cyclomatic_complexity INT64, context STRING, context_type STRING, class_context STRING, class_context_line INT64, module_context STRING, is_dependency BOOLEAN, decorators STRING[], args STRING[], http_method STRING, http_path STRING, embedding DOUBLE[], visibility STRING, modifiers STRING[], is_composable BOOLEAN, PRIMARY KEY (uid)"),
+            ("Function", "uid STRING, name STRING, path STRING, line_number INT64, occurrence_index INT64, end_line INT64, source STRING, docstring STRING, lang STRING, cyclomatic_complexity INT64, context STRING, context_type STRING, class_context STRING, class_context_line INT64, module_context STRING, is_dependency BOOLEAN, decorators STRING[], args STRING[], arg_types STRING[], http_method STRING, http_path STRING, embedding DOUBLE[], visibility STRING, modifiers STRING[], is_composable BOOLEAN, PRIMARY KEY (uid)"),
             ("Class", "uid STRING, name STRING, path STRING, line_number INT64, occurrence_index INT64, end_line INT64, source STRING, docstring STRING, lang STRING, node_type STRING, is_dependency BOOLEAN, decorators STRING[], visibility STRING, modifiers STRING[], PRIMARY KEY (uid)"),
             ("Variable", "uid STRING, name STRING, path STRING, line_number INT64, occurrence_index INT64, source STRING, docstring STRING, lang STRING, value STRING, context STRING, is_dependency BOOLEAN, PRIMARY KEY (uid)"),
             ("Trait", "uid STRING, name STRING, path STRING, line_number INT64, occurrence_index INT64, end_line INT64, source STRING, docstring STRING, lang STRING, is_dependency BOOLEAN, PRIMARY KEY (uid)"),
@@ -385,6 +502,7 @@ class EmbeddedGraphManager(GraphQueryInterface):
             ("Function", "is_composable", "BOOLEAN"),
             ("Function", "http_method", "STRING"),
             ("Function", "http_path", "STRING"),
+            ("Function", "arg_types", "STRING[]"),
             # Kotlin/JVM precision improvements
             ("Function", "class_context_line", "INT64"),
             ("Function", "module_context", "STRING"),
@@ -515,7 +633,15 @@ class EmbeddedGraphManager(GraphQueryInterface):
                 # Without this call the process hangs on exit because the
                 # embedded Kùzu engine keeps background threads alive.
                 try:
-                    if not self._db.is_closed():
+                    # kuzu exposes is_closed as a METHOD on some builds and a
+                    # bool ATTRIBUTE on others (0.11.x). Calling the attribute
+                    # raised "'bool' object is not callable" — which this
+                    # except swallowed, so the close NEVER ran and the
+                    # background threads it exists to stop stayed alive.
+                    closed = self._db.is_closed
+                    if callable(closed):
+                        closed = closed()
+                    if not closed:
                         self._db.close()
                         info_logger(f"{self.BACKEND_SPEC.display_name} database closed successfully")
                 except Exception as e:
@@ -587,16 +713,19 @@ class EmbeddedDriverWrapper:
         compat_state = getattr(self, "_compat_state", None)
         pool = getattr(self, "_pool", None)
         display_name = getattr(self, "_display_name", "Embedded")
+        backend_id = getattr(self, "_backend_id", "embedded")
         if pool is not None:
             return EmbeddedSessionWrapper(
                 pool, getattr(self, "_write_lock", None),
                 compat_state=compat_state, display_name=display_name,
+                backend_id=backend_id,
             )
         else:
             db = getattr(self, "db", None) or getattr(self, "conn", None)
             write_lock = getattr(self, "_write_lock", None) or getattr(self, "_query_lock", None)
             return EmbeddedSessionWrapper(
                 db, write_lock, compat_state=compat_state, display_name=display_name,
+                backend_id=backend_id,
             )
     def close(self):
         pass
@@ -606,10 +735,12 @@ class EmbeddedDriverWrapper:
 
 
 class EmbeddedSessionWrapper:
-    def __init__(self, pool_or_conn, write_lock=None, compat_state=None, display_name: str = "Embedded"):
+    def __init__(self, pool_or_conn, write_lock=None, compat_state=None, display_name: str = "Embedded",
+                 backend_id: str = "embedded"):
         self._write_lock = write_lock or threading.Lock()
         self._query_lock = self._write_lock
         self._display_name = display_name
+        self._backend_id = backend_id
         # Disabled-query-type state is shared via the manager's compat_state so
         # fail-fast disabling persists across sessions. A standalone session
         # (tests / legacy callers) gets its own private state.
@@ -622,7 +753,20 @@ class EmbeddedSessionWrapper:
         # Backward compatibility check: check if it's a pool or connection
         if hasattr(pool_or_conn, "get") and not hasattr(pool_or_conn, "execute"):
             self._pool = pool_or_conn
-            self.conn = self._pool.get()
+            try:
+                # The embedded manager is a per-subclass singleton: switching
+                # db_path closes the old database and drains its pool. A caller
+                # holding a STALE driver reference then blocked here forever
+                # with no diagnostic. Fail loudly instead.
+                self.conn = self._pool.get(timeout=30)
+            except queue.Empty:
+                raise RuntimeError(
+                    "No database connection available after 30s — this driver's "
+                    "connection pool is exhausted or its database manager was "
+                    "closed/switched to another path. Re-acquire the driver via "
+                    "get_database_manager().get_driver() instead of holding a "
+                    "stale reference."
+                )
         else:
             self._pool = None
             self.conn = pool_or_conn
@@ -832,6 +976,60 @@ class EmbeddedSessionWrapper:
             with self._write_lock:
                 result = self.conn.execute(translated_query, translated_params)
 
+                # LadybugDB (0.19.x) state-dependently drops SOME rows of a
+                # batched relationship-only UNWIND MERGE — no error is raised,
+                # the MERGE just writes nothing for those rows (a 17-row
+                # Struct-CONTAINS batch wrote 12; #1710). Locally an immediate
+                # identical re-run bound the stragglers, but on CI the drop
+                # survives re-execution, so after the batched pass every row
+                # is replayed as a single-row batch through the SAME translated
+                # query. MERGE is idempotent, so the union is safe; only
+                # ladybug pays the cost. The generic per-row rewrite path is
+                # deliberately NOT used here — its query surgery loses ~51
+                # CONTAINS edges (the #1612 signature).
+                if (
+                    getattr(self, "_backend_id", "") == "ladybugdb"
+                    and "MERGE" in query
+                    and ("-[" in query or "]->" in query)
+                    and "RETURN" not in query.upper()
+                ):
+                    _u = re.search(r"UNWIND\s+\$(\w+)\s+AS\s+\w+", translated_query)
+                    _rows = _u and translated_params.get(_u.group(1))
+                    if isinstance(_rows, list) and len(_rows) > 1:
+                        # Best-effort only: the batched pass above already
+                        # wrote what it could, so a failing single must NEVER
+                        # propagate — the first singles attempt let one raise
+                        # and the escaping exception aborted the writer's
+                        # remaining batches, costing ~51 CONTAINS edges (the
+                        # union of idempotent MERGEs cannot otherwise shrink).
+                        _single_failures = 0
+                        _first_single_error = None
+                        for _row in _rows:
+                            single = dict(translated_params)
+                            single[_u.group(1)] = [_row]
+                            try:
+                                self.conn.execute(translated_query, single)
+                            except Exception as _se:
+                                _single_failures += 1
+                                if _first_single_error is None:
+                                    _first_single_error = str(_se)[:160]
+                        if _single_failures:
+                            debug_log(
+                                f"Ladybug single-row replay: {_single_failures}/{len(_rows)} "
+                                f"rows errored (first: {_first_single_error}) — batched pass "
+                                f"result stands — query: {query[:90]}"
+                            )
+                        if os.environ.get("CGC_LBG_DIAG") and "helpers.go" in str(translated_params):
+                            try:
+                                _mq = re.sub(r"MERGE\s.*", "RETURN count(*)", translated_query, flags=re.S)
+                                _mr = self.conn.execute(_mq, translated_params)
+                                _matched = _mr.get_next()[0]
+                                import sys as _sys
+                                print(f"LBG_DIAG matched={_matched} batch={len(_rows)} q={translated_query[:110].strip()!r}", file=_sys.stderr, flush=True)
+                            except Exception as _de:
+                                import sys as _sys
+                                print(f"LBG_DIAG count-err {str(_de)[:120]}", file=_sys.stderr, flush=True)
+
             return EmbeddedResultWrapper(result)
         except Exception as e:
             if self._should_fail_fast(query_type, e):
@@ -878,6 +1076,8 @@ class EmbeddedSessionWrapper:
                         )
                         
                         last_result = None
+                        dropped = 0
+                        first_drop_error = None
                         for item in batch_data:
                             loop_params = parameters.copy()
                             loop_params.pop(batch_param, None)
@@ -890,8 +1090,34 @@ class EmbeddedSessionWrapper:
                             except Exception as nested_e:
                                 nested_err_str = str(nested_e).lower()
                                 if "binder" in nested_err_str or "cannot find a valid label" in nested_err_str:
+                                    # Expected: label-pair probing legitimately
+                                    # misses on schemaless shapes.
                                     continue
-                                raise nested_e
+                                # Transient failure (lock contention, buffer
+                                # pressure): retry the ROW once before dropping
+                                # it — writes are MERGE-idempotent. Silent
+                                # drops here were LadybugDB's missing-edge
+                                # signature in the parity run (#1612).
+                                try:
+                                    last_result = self.run(loop_query, **loop_params)
+                                except Exception as retry_e:
+                                    dropped += 1
+                                    if first_drop_error is None:
+                                        first_drop_error = str(retry_e)[:160]
+                        if dropped:
+                            if dropped == len(batch_data) and dropped > 0:
+                                # Every row failing is systematic breakage, not
+                                # transient pressure — raise so the caller's
+                                # own retry/failure accounting still engages.
+                                raise RuntimeError(
+                                    f"Per-row fallback failed for ALL {dropped} rows "
+                                    f"(first error: {first_drop_error}) — query: {query[:90]}"
+                                )
+                            warning_logger(
+                                f"Per-row fallback dropped {dropped}/{len(batch_data)} "
+                                f"rows after retry (first error: {first_drop_error}) — "
+                                f"query: {query[:90]}"
+                            )
                         return last_result or EmbeddedResultWrapper(None)
 
 
@@ -915,7 +1141,7 @@ class EmbeddedSessionWrapper:
             'File': {'path', 'name', 'relative_path', 'package_name', 'language', 'is_dependency'},
             'Directory': {'path', 'name'},
             'Module': {'name', 'lang', 'full_import_name', 'path', 'line_number'},
-            'Function': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'cyclomatic_complexity', 'context', 'context_type', 'class_context', 'class_context_line', 'module_context', 'is_dependency', 'decorators', 'args', 'http_method', 'http_path', 'visibility', 'modifiers', 'is_composable'},
+            'Function': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'cyclomatic_complexity', 'context', 'context_type', 'class_context', 'class_context_line', 'module_context', 'is_dependency', 'decorators', 'args', 'arg_types', 'http_method', 'http_path', 'visibility', 'modifiers', 'is_composable'},
             'Class': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'node_type', 'is_dependency', 'decorators', 'visibility', 'modifiers'},
             'Variable': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'source', 'docstring', 'lang', 'value', 'context', 'is_dependency'},
             'Trait': {'uid', 'name', 'path', 'line_number', 'occurrence_index', 'end_line', 'source', 'docstring', 'lang', 'is_dependency'},
@@ -980,6 +1206,26 @@ class EmbeddedSessionWrapper:
         #   b) MERGE uid injection from row fields (row.name, row.line_number, …)
         unwind_m = re.search(r'UNWIND\s+\$(\w+)\s+AS\s+(\w+)', query)
         if unwind_m:
+            # 1.5-pre: Collapse consecutive MATCH clauses into one comma-joined
+            # MATCH. LadybugDB's planner silently yields ZERO rows for
+            # UNWIND → MATCH (a {…}) → MATCH (b {…}) when the first MATCH is an
+            # index-map lookup (File-by-path being the everyday case): each
+            # MATCH works alone, chained they produce nothing — no error is
+            # raised, so downstream MERGEs quietly write no edges. That was the
+            # exact signature of the parity gap (all File-sourced CALLS edges
+            # and a handful of Struct CONTAINS edges missing on ladybug only).
+            # The comma form `MATCH (a {…}), (b {…})` is semantically identical
+            # for non-optional patterns and both engines plan it correctly.
+            # Only simple node patterns (no relationship arrows, no parens
+            # inside the pattern) directly adjacent to the next MATCH are
+            # merged, and never across OPTIONAL MATCH.
+            _match_merge_re = re.compile(
+                r'(?<!OPTIONAL )\bMATCH\s*(\([^()]*\)(?:\s*,\s*\([^()]*\))*)\s+MATCH\s*(?=\()'
+            )
+            _prev = None
+            while _prev != query:
+                _prev = query
+                query = _match_merge_re.sub(r'MATCH \1, ', query, count=1)
             batch_param = unwind_m.group(1)
             row_var = unwind_m.group(2)
             batch_data = parameters.get(batch_param)
