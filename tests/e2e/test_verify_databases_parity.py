@@ -4,6 +4,7 @@ import time
 import json
 import shutil
 import asyncio
+import tempfile
 import pytest
 from pathlib import Path
 from typing import Tuple, Dict
@@ -187,6 +188,31 @@ async def _run_database_parity_e2e(temp_test_dir):
         if importlib.util.find_spec(pkg_map[db]) is None:
             print(f"Skipping {db}: {pkg_map[db]} driver not installed.")
             continue
+        if db in ("kuzudb", "ladybugdb"):
+            # find_spec() 只能证明包目录存在，证明不了底层原生库能加载，两者会脱钩。
+            # 实测 ladybug 0.19.1 的 cp314-win_amd64 wheel 未包含 lbug C API 共享库：
+            # `from . import _lbug` 抛 ImportError 被 _backend.get_pybind_module()
+            # 静默吞掉，Database() 初始化于是回退到 C API 后端并抛
+            # "Could not find lbug C API shared library"，把整个 e2e 拖红。
+            # 包"已安装"但后端不可用时，按本测试既有约定（缺驱动即 skip）应当跳过，
+            # 而不是以失败告终 —— 否则环境/打包问题会被误报成代码缺陷。
+            probe_dir = None
+            probe_err = None
+            try:
+                mod = importlib.import_module(pkg_map[db])
+                probe_dir = tempfile.mkdtemp(prefix="cgc_probe_")
+                probe_db = mod.Database(os.path.join(probe_dir, "probe.db"))
+                _close = getattr(probe_db, "close", None)
+                if callable(_close):
+                    _close()
+            except Exception as e:  # 任何原生库加载/初始化失败都视为后端不可用
+                probe_err = f"{type(e).__name__}: {e}"
+            finally:
+                if probe_dir:
+                    shutil.rmtree(probe_dir, ignore_errors=True)
+            if probe_err:
+                print(f"Skipping {db}: {pkg_map[db]} installed but native backend unusable -> {probe_err}")
+                continue
         db_types_to_run.append(db)
         
     db_types = db_types_to_run
