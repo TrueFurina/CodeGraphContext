@@ -4,6 +4,7 @@ import time
 import json
 import shutil
 import asyncio
+import subprocess
 import pytest
 from pathlib import Path
 from typing import Tuple, Dict
@@ -217,6 +218,13 @@ async def _run_database_parity_e2e(temp_test_dir):
     os.environ.setdefault('NEO4J_PASSWORD', '12345678')
     
     import importlib.util
+    # FalkorDB Lite 的可用性由产品自身判定：Unix + Python >= 3.12 + redislite.falkordb_client，
+    # Windows 明确不支持。仅凭 pip 包存在就排入待跑，会经 get_database_manager 的
+    # 回退链落到别的嵌入式后端上（实测 Windows 落到损坏的 ladybug）。
+    try:
+        from codegraphcontext.core import is_falkordb_usable
+    except Exception:
+        is_falkordb_usable = None
     project_path = Path("tests/fixtures/sample_projects").resolve()
     
     db_types_to_run = []
@@ -237,6 +245,10 @@ async def _run_database_parity_e2e(temp_test_dir):
             if probe_err is not None:
                 print(f"Skipping {db}: {pkg_map[db]} installed but native backend unusable -> {probe_err}")
                 continue
+        if db == "falkordb" and is_falkordb_usable is not None and not is_falkordb_usable():
+            print("Skipping falkordb: FalkorDB Lite is not supported/installed on this platform "
+                  "(requires Unix and Python >= 3.12).")
+            continue
         db_types_to_run.append(db)
         
     db_types = db_types_to_run
